@@ -1,33 +1,77 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
+import { z } from 'zod';
 import { GoogleGenAI } from '@google/genai';
+import { AutonomousOrchestrator } from './agents/orchestrator.js';
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+// Strict Zod Schema for incoming request validation
+export const AnalyzeRequestSchema = z.object({
+  query: z.string().min(1, 'query is required and cannot be empty'),
+  priority: z.enum(['critical', 'high', 'normal']).default('high'),
+  parameters: z.record(z.unknown()).optional().default({}),
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'healthy', project: 'ethglobal-singapore-2026-auton', uptime: process.uptime() });
+// Strict Zod Schema for outgoing response contract
+export const ConsensusResponseSchema = z.object({
+  taskId: z.string(),
+  topic: z.string(),
+  status: z.enum(['completed', 'verified']),
+  consensusScore: z.number().min(0).max(1),
+  summary: z.string(),
+  subAgentResults: z.object({
+    validatorPassed: z.boolean(),
+    synthesizerSummary: z.string(),
+  }),
+  fingerprintSha256: z.string().length(64),
+  executedAt: z.string(),
 });
 
-app.post('/api/analyze', async (req, res) => {
+const apiKey = process.env.GEMINI_API_KEY || '';
+const ai = apiKey
+  ? new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    })
+  : null;
+
+const orchestrator = new AutonomousOrchestrator(ai);
+
+app.get('/api/health', (req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    project: 'ethglobal-singapore-2026-auton',
+    model: 'gemini-3.8-flash',
+    hasApiKey: !!apiKey,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.post('/api/analyze', async (req: Request, res: Response) => {
   try {
-    const { query } = req.body;
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Analyze input for competition ETHGlobal Singapore 2026: Autonomous Agents Track: ${query}`,
+    const parsedInput = AnalyzeRequestSchema.parse(req.body);
+
+    const result = await orchestrator.dispatch({
+      id: `task-${Date.now()}`,
+      topic: parsedInput.query,
+      priority: parsedInput.priority,
+      parameters: parsedInput.parameters,
     });
-    res.json({ output: response.text });
+
+    const validatedOutput = ConsensusResponseSchema.parse(result);
+    res.json(validatedOutput);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Validation Error', details: err.errors });
+    }
+    res.status(500).json({ error: err.message || 'Execution failed' });
   }
 });
 
-const port = process.env.PORT || 8080;
+const port = Number(process.env.PORT) || 8080;
 app.listen(port, () => console.log(`Server active on port ${port}`));
